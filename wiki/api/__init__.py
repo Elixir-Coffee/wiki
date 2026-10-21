@@ -14,12 +14,18 @@ def get_space_capabilities(space: str) -> dict:
 	always remains server-side in the permission hooks and Change Request
 	controller.
 	"""
-	from wiki.permissions import can_contribute_to_space, can_read_space, can_write_space
+	from wiki.permissions import (
+		can_contribute_to_space,
+		can_delete_space,
+		can_read_space,
+		can_write_space,
+	)
 
 	return {
 		"can_read": can_read_space(space),
 		"can_write": can_write_space(space),
 		"can_contribute": can_contribute_to_space(space),
+		"can_delete": can_delete_space(space),
 	}
 
 
@@ -39,7 +45,7 @@ def get_user_info() -> dict:
 		"full_name": user.full_name,
 		"email": user.email,
 		"user_image": user.user_image,
-		"roles": user.roles,
+		"roles": [{"role": row.role} for row in user.roles],
 		"brand_image": frappe.get_single_value("Website Settings", "banner_image"),
 		"language": user.language,
 	}
@@ -58,6 +64,34 @@ def get_translations():
 def _to_webp(path_or_url: str) -> str:
 	"""Swap any file extension for `.webp` (works for both fs paths and URLs)."""
 	return os.path.splitext(path_or_url)[0] + ".webp"
+
+
+def _save_webp_without_overwrite(image, name: str) -> str:
+	"""Write `image` to a new file, never over an existing one.
+
+	generate_file_name only checks that the name is free. Two same-named
+	uploads converting at once (several images pasted together) both passed
+	that check, and the second write replaced the first image.
+	"""
+	from frappe.core.doctype.file.utils import get_file_name
+	from frappe.utils import get_files_path
+
+	for _ in range(5):
+		path = get_files_path(name)
+		try:
+			# nosemgrep: frappe-semgrep-rules.rules.security.frappe-security-file-traversal
+			f = open(path, "xb")
+		except FileExistsError:
+			name = get_file_name(name, frappe.generate_hash(length=6))
+			continue
+		try:
+			with f:
+				image.save(f, "WEBP")
+		except Exception:
+			os.remove(path)
+			raise
+		return name
+	raise FileExistsError(name)
 
 
 def convert_file_to_webp(file_doc) -> str:
@@ -82,7 +116,7 @@ def convert_file_to_webp(file_doc) -> str:
 
 	try:
 		image, _, _ = get_local_image(file_url)
-		image.save(get_files_path(webp_name), "WEBP")
+		webp_name = _save_webp_without_overwrite(image, webp_name)
 	except Exception:
 		# Corrupt or unsupported image — keep the original upload rather than
 		# failing the whole request and losing the author's image.

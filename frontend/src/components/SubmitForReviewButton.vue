@@ -25,7 +25,8 @@
 		v-model:open="showConfirmDialog"
 		:title="__('Submit for review')"
 		:message="confirmMessage"
-		:icon="{ name: 'lucide-git-branch', theme: 'blue' }"
+		icon="lucide-git-branch"
+		theme="blue"
 		:actions="confirmActions"
 	/>
 </template>
@@ -68,7 +69,7 @@ const visible = computed(() => {
 	if (spaceStore.isGitSynced) return false;
 	if (!crStore.isChangeRequestMode) return false;
 	if (crStore.finalizing) return false;
-	// Autosave takes ten seconds to turn typing into a change row. Counting an
+	// Autosave waits for a pause before typing becomes a change row. Counting an
 	// unsaved buffer as submittable work keeps the button from disappearing in
 	// that window — there is no Save button left to fill it.
 	if (crStore.changeCount === 0 && !draftStore.hasUnsavedEditorContent) {
@@ -92,6 +93,12 @@ const submitButtonTitle = computed(() => {
 	}
 	if (draftStore.finalizationBlocker === 'failed') {
 		return __('Resolve failed changes before submitting');
+	}
+	if (draftStore.finalizationBlocker === 'uploading') {
+		return __('Wait for uploads to finish before submitting');
+	}
+	if (draftStore.finalizationBlocker === 'upload-failed') {
+		return __('Remove failed uploads before submitting');
 	}
 	if (draftStore.finalizationBlocker === 'pending') {
 		return __('Wait for pending changes to sync before submitting');

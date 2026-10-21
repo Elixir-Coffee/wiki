@@ -41,8 +41,29 @@
 	}
 
 	.wiki-document-content img {
+		display: block;
 		max-width: 100%;
 		height: auto;
+		margin: 0 auto;
+	}
+
+	/* wkhtmltopdf has no :has() or fit-content; a table shrinks to the image. */
+	.wiki-document-content p[data-align="left"],
+	.wiki-document-content p[data-align="right"] {
+		display: table;
+	}
+
+	.wiki-document-content p[data-align="right"] {
+		margin-left: auto;
+	}
+
+	.wiki-document-content img + em,
+	.wiki-document-content picture + em {
+		display: block;
+		margin: 0.25rem 0 1rem;
+		font-size: 0.875rem;
+		color: #7c7c7c;
+		text-align: center;
 	}
 
 	.wiki-document-content a {

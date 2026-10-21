@@ -47,6 +47,8 @@ def slugify(text: str) -> str:
 	return text
 
 
+WIKI_LINK_PREFIX = "wiki:"
+
 # Default titles for each callout type
 DEFAULT_TITLES = {
 	"note": "Note",
@@ -485,6 +487,18 @@ def _render_blank_line(tokens, idx, options, env) -> str:
 	return '<p class="wiki-blank-line" aria-hidden="true"><br></p>\n'
 
 
+# The exact `<picture>` the editor writes for an image with a dark mode file,
+# a width or an alignment, plus its optional `*caption*` line. markdown-it reads
+# it as one raw HTML block, caption included, so the caption would otherwise
+# show as literal asterisks.
+PICTURE_BLOCK_PATTERN = re.compile(
+	r'<picture>\s*(?:<source srcset="(?P<dark_src>[^"]*)" media="\(prefers-color-scheme: dark\)">\s*)?'
+	r'<img src="(?P<src>[^"]*)" alt="(?P<alt>[^"]*)"(?: title="(?P<title>[^"]*)")?'
+	r'(?: width="(?P<width>\d+)")?(?: data-align="(?P<align>left|center|right)")?\s*/?>\s*</picture>'
+	r"(?:\n\*(?P<caption>[^*\n]+)\*)?\s*"
+)
+
+
 def _build_markdown() -> MarkdownIt:
 	"""Build a configured markdown-it-py instance with our render overrides."""
 	md = (
@@ -541,6 +555,70 @@ def _build_markdown() -> MarkdownIt:
 		return s + " />"
 
 	md.renderer.rules["image"] = image_render
+
+	def html_block_render(tokens, idx, options, env):
+		# Pictures with no blank line between them arrive as one HTML block.
+		content = tokens[idx].content
+		pictures = []
+		position = 0
+		while position < len(content):
+			match = PICTURE_BLOCK_PATTERN.match(content, position)
+			if not match:
+				return "".join(pictures) + content[position:]
+			pictures.append(render_picture(match))
+			position = match.end()
+		return "".join(pictures)
+
+	def render_picture(match):
+		# Same shape as a plain image with a caption, so the caption CSS is shared.
+		alt = _remove_script_tags(match["alt"])
+		title = _remove_script_tags(match["title"])
+		img_attrs = f' title="{title}"' if title else ""
+		if match["width"]:
+			img_attrs += f' width="{match["width"]}"'
+		if match["align"]:
+			img_attrs += f' data-align="{match["align"]}"'
+		source = (
+			f'<source srcset="{match["dark_src"]}" media="(prefers-color-scheme: dark)">'
+			if match["dark_src"] is not None
+			else ""
+		)
+		caption = match["caption"]
+		caption_html = f"\n<em>{md.renderInline(caption)}</em>" if caption else ""
+		# On the <p> too, so the PDF renderer (no :has()) can align image and caption together.
+		paragraph_attrs = f' data-align="{match["align"]}"' if match["align"] else ""
+		return (
+			f'<p{paragraph_attrs}><picture>{source}<img src="{match["src"]}" alt="{alt}"{img_attrs} /></picture>'
+			f"{caption_html}</p>\n"
+		)
+
+	md.renderer.rules["html_block"] = html_block_render
+
+	def softbreak_render(tokens, idx, options, env):
+		# No <br> before a caption, so the `img + em` caption CSS still matches.
+		image_on_own_line = idx == 1 or (idx > 1 and tokens[idx - 2].type in ("softbreak", "hardbreak"))
+		is_caption = (
+			image_on_own_line
+			and tokens[idx - 1].type == "image"
+			and idx < len(tokens) - 1
+			and tokens[idx + 1].type == "em_open"
+		)
+		return "\n" if is_caption else "<br />\n"
+
+	md.renderer.rules["softbreak"] = softbreak_render
+
+	def link_open_render(tokens, idx, options, env):
+		# An internal link names the page, not its route: `[Label](wiki:<doc_key>)`.
+		# It renders with the key alone, and the reader fills in the page's
+		# current route after the render cache (resolve_wiki_links).
+		tok = tokens[idx]
+		href = tok.attrGet("href") or ""
+		doc_key = href[len(WIKI_LINK_PREFIX) :]
+		if href.startswith(WIKI_LINK_PREFIX) and re.fullmatch(r"\w+", doc_key):
+			tok.attrs = {"data-wiki-link": doc_key, **{k: v for k, v in tok.attrs.items() if k != "href"}}
+		return md.renderer.renderToken(tokens, idx, options, env)
+
+	md.renderer.rules["link_open"] = link_open_render
 
 	# after("block"): tokens and their line maps exist, `state.src` is already
 	# normalized (CRLF collapsed, so it lines up with the maps), and we still run

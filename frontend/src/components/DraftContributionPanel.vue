@@ -434,7 +434,6 @@ async function saveTitleIfChanged() {
 	if (!crPage.value?.doc_key) return;
 	try {
 		await draftStore.updateNode(crPage.value.doc_key, { title: newTitle });
-		await loadCrPage();
 	} catch (error) {
 		toast.error(error.messages?.[0] || __('Error updating title'));
 	}
@@ -455,7 +454,6 @@ async function saveRoute(close) {
 	isSavingRoute.value = true;
 	try {
 		await draftStore.updateNode(crPage.value.doc_key, { route: newRoute });
-		await loadCrPage();
 		close();
 	} catch (error) {
 		toast.error(error.messages?.[0] || __('Error updating route'));
@@ -473,6 +471,8 @@ async function saveContent(content) {
 			editableTitle.value,
 		);
 	} catch (error) {
+		// The sync alert says so and stays up; a toast per blocked autosave would not.
+		if (error.code === 'version_conflict') return;
 		console.error('Error saving draft:', error);
 		// Inline failure UX comes in task #7; keep a toast for now so the
 		// user isn't left wondering whether their save worked.

@@ -25,8 +25,8 @@
 
 		<ScrollArea class="min-h-0 flex-1" viewport-class="p-3">
 			<div class="flex flex-col gap-6">
-				<!-- On a git-synced page the repo owns the title, the slug, the
-				     route and whether the page ships: the next sync rewrites
+				<!-- On a git-synced page the repo owns the title, the route
+				     and whether the page ships: the next sync rewrites
 				     anything typed here. The social preview below is wiki-side
 				     data the repo never carries, so it stays editable. -->
 				<section class="flex flex-col gap-3">
@@ -44,13 +44,6 @@
 						:disabled="readonly"
 					/>
 					<FormControl
-						v-model="form.slug"
-						type="text"
-						:label="__('Slug')"
-						:placeholder="__('page-slug')"
-						:disabled="readonly"
-					/>
-					<FormControl
 						v-model="form.route"
 						type="text"
 						:label="__('Route')"
@@ -65,7 +58,24 @@
 								{{ __('Visible on the public site') }}
 							</span>
 						</div>
-						<Switch v-model="form.isPublished" :disabled="readonly" />
+						<Switch
+							v-model="form.isPublished"
+							:disabled="readonly"
+							:aria-label="__('Published')"
+						/>
+					</div>
+					<div class="flex items-center justify-between gap-3">
+						<div class="flex flex-col">
+							<span class="text-sm text-ink-gray-7">{{ __('Disable Indexing') }}</span>
+							<span class="text-xs text-ink-gray-5">
+								{{ __('Prevent search engines from indexing this page') }}
+							</span>
+						</div>
+						<Switch
+							v-model="form.disableIndexing"
+							:disabled="!canEditMeta"
+							:aria-label="__('Disable Indexing')"
+						/>
 					</div>
 				</section>
 
@@ -77,6 +87,7 @@
 						:label="__('Meta title')"
 						:placeholder="title"
 						:description="__('Leave empty to use the page title')"
+						:disabled="!canEditMeta"
 					/>
 					<FormControl
 						v-model="form.metaDescription"
@@ -85,6 +96,7 @@
 						:rows="3"
 						:placeholder="__('A short summary shown in search results and link previews')"
 						:description="descriptionHint"
+						:disabled="!canEditMeta"
 					/>
 					<div class="flex flex-col gap-1.5">
 						<label class="text-sm text-ink-gray-5">{{ __('Meta image') }}</label>
@@ -101,7 +113,7 @@
 									class="lucide-loader-2 size-5 animate-spin text-white"
 									aria-hidden="true"
 								/>
-								<template v-else>
+								<template v-else-if="canEditMeta">
 									<Button size="sm" variant="solid" @click="pickImage">
 										{{ __('Replace') }}
 									</Button>
@@ -115,7 +127,7 @@
 							v-else
 							type="button"
 							class="flex aspect-[1200/630] w-full flex-col items-center justify-center gap-1.5 rounded-5 border border-dashed border-outline-gray-3 bg-surface-gray-1 text-sm text-ink-gray-5 hover:bg-surface-gray-2"
-							:disabled="isUploadingImage"
+							:disabled="isUploadingImage || !canEditMeta"
 							@click="pickImage"
 						>
 							<span
@@ -243,6 +255,7 @@
 <script setup>
 import { countWords, readingMinutes } from '@/lib/readingStats';
 import { useDraftWorkspaceStore } from '@/stores/draftWorkspace';
+import { useSpaceStore } from '@/stores/space';
 import { useUserStore } from '@/stores/user';
 import {
 	Badge,
@@ -281,10 +294,6 @@ const props = defineProps({
 		type: String,
 		default: '',
 	},
-	slug: {
-		type: String,
-		default: '',
-	},
 	route: {
 		type: String,
 		default: '',
@@ -300,10 +309,11 @@ const props = defineProps({
 	},
 });
 
-const emit = defineEmits(['close', 'node-updated']);
+const emit = defineEmits(['close']);
 
 const draftStore = useDraftWorkspaceStore();
 const userStore = useUserStore();
+const spaceStore = useSpaceStore();
 const fileUploader = useFileUpload();
 
 const isSaving = ref(false);
@@ -312,24 +322,24 @@ const imageInput = ref(null);
 
 const form = reactive({
 	title: '',
-	slug: '',
 	route: '',
 	isPublished: false,
 	metaTitle: '',
 	metaDescription: '',
 	metaImage: '',
+	disableIndexing: false,
 });
 
 // The saved values every field is measured against — the panel is a form, not
 // a set of live controls, so nothing lands until Save.
 const saved = computed(() => ({
 	title: props.title || '',
-	slug: props.slug || '',
 	route: props.route || '',
 	isPublished: Boolean(props.published),
 	metaTitle: props.docResource.doc?.meta_title || '',
 	metaDescription: props.docResource.doc?.meta_description || '',
 	metaImage: props.docResource.doc?.meta_image || '',
+	disableIndexing: Boolean(props.docResource.doc?.disable_indexing),
 }));
 
 // The title is also edited in the prose column, and the tree renames pages
@@ -346,7 +356,16 @@ watch(
 	{ immediate: true },
 );
 
-const META_FIELDS = ['metaTitle', 'metaDescription', 'metaImage'];
+const META_FIELDS = [
+	'metaTitle',
+	'metaDescription',
+	'metaImage',
+	'disableIndexing',
+];
+
+// Meta fields are written to the document, which takes space write access.
+// Contributing through a change request is not enough.
+const canEditMeta = computed(() => spaceStore.canWriteSpace);
 
 const isDirty = computed(() =>
 	Object.entries(saved.value).some(
@@ -470,9 +489,6 @@ function nodeChanges() {
 	if (form.title.trim() && form.title !== current.title) {
 		changes.title = form.title.trim();
 	}
-	if (form.slug.trim() && form.slug !== current.slug) {
-		changes.slug = form.slug.trim();
-	}
 	const route = form.route.trim().replace(/^\/+/, '');
 	if (route && route !== current.route) changes.route = route;
 	if (form.isPublished !== current.isPublished) {
@@ -489,6 +505,9 @@ function metaChanges() {
 		changes.meta_description = form.metaDescription;
 	}
 	if (form.metaImage !== current.metaImage) changes.meta_image = form.metaImage;
+	if (form.disableIndexing !== current.disableIndexing) {
+		changes.disable_indexing = form.disableIndexing ? 1 : 0;
+	}
 	return changes;
 }
 
@@ -500,10 +519,9 @@ async function save() {
 		if (Object.keys(node).length) {
 			if (!props.docKey) throw new Error(__('No active change request'));
 			await draftStore.updateNode(props.docKey, node);
-			emit('node-updated');
 		}
 		if (Object.keys(meta).length) {
-			await props.docResource.setValue.submit(meta);
+			await props.docResource.updateMeta.submit(meta);
 		}
 		toast.success(__('Page settings saved'));
 		// Retry a preview that failed before this save fixed its inputs.

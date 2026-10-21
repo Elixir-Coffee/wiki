@@ -14,8 +14,20 @@
 				<template #nav>
 					<MobileNav>
 						<MobileNavItem
+							v-if="userStore.isWikiManager"
+							:label="__('Overview')"
+							:route="{ name: 'Overview' }"
+							:active="route.name === 'Overview'"
+						>
+							<template #default="{ active }">
+								<span
+									class="lucide-layout-grid size-6"
+									:class="active ? 'text-ink-gray-8' : 'text-ink-gray-5'" aria-hidden="true" />
+							</template>
+						</MobileNavItem>
+						<MobileNavItem
 							:label="__('Spaces')"
-							:to="{ name: 'Overview' }"
+							:route="{ name: 'AllSpaces' }"
 							:active="isSpacesRoute"
 						>
 							<template #default="{ active }">
@@ -26,8 +38,8 @@
 						</MobileNavItem>
 						<MobileNavItem
 							:label="__('Change Requests')"
-							:to="{ name: 'ChangeRequests' }"
-							:active="route.name === 'ChangeRequests'"
+							:route="{ name: 'ChangeRequests' }"
+							:active="['ChangeRequests', 'ChangeRequestReview'].includes(route.name)"
 						>
 							<template #default="{ active }">
 								<span
@@ -43,7 +55,7 @@
 					<!-- One navigation column that drills: the library at the top
 					     level, the space itself once you are inside one. -->
 					<SpaceSidebar v-if="spaceId" :key="spaceId" :space-id="spaceId" />
-					<LibrarySidebar v-else />
+					<LibrarySidebar v-else-if="isRouteReady" />
 				</template>
 				<slot></slot>
 			</DesktopShell>
@@ -82,14 +94,16 @@
 		</div>
 
 		<WikiSettings v-model="showWikiSettings" :initial-tab="initialTab" />
+		<CommandPalette v-if="hasAccess" />
 	</div>
 </template>
 
 <script setup>
 import { useUserStore } from '@/stores/user';
 import { DesktopShell, MobileNav, MobileNavItem, MobileShell } from 'frappe-ui';
-import { computed, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import CommandPalette from '../components/CommandPalette.vue';
 import LibrarySidebar from '../components/LibrarySidebar.vue';
 import SpaceSidebar from '../components/SpaceSidebar.vue';
 import WikiSettings from '../components/WikiSettings/WikiSettings.vue';
@@ -112,9 +126,15 @@ const hasAccess = computed(() => userStore.canAccessWiki);
 
 const spaceId = computed(() => route.params.spaceId || null);
 
+const isRouteReady = ref(false);
+const markRouteReady = () => {
+	isRouteReady.value = true;
+};
+router.isReady().then(markRouteReady, markRouteReady);
+
 // Spaces stays lit across every space route (overview + space details).
 const isSpacesRoute = computed(
-	() => route.name === 'Overview' || Boolean(spaceId.value),
+	() => route.name === 'AllSpaces' || Boolean(spaceId.value),
 );
 
 // The GitHub-App manifest flow redirects back here with ?github_app_created=1.
@@ -126,8 +146,7 @@ watch(
 	(created) => {
 		if (!created) return;
 		open('github');
-		const query = { ...route.query };
-		delete query.github_app_created;
+		const { github_app_created, ...query } = route.query;
 		router.replace({ query });
 	},
 	{ immediate: true },

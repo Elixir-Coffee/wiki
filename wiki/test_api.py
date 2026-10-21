@@ -6,8 +6,8 @@ import os
 from io import BytesIO
 
 import frappe
-from frappe.tests.utils import FrappeTestCase
 
+from wiki.tests import WikiTestCase as FrappeTestCase
 from wiki.tests.factory import WikiFixtureMixin
 
 
@@ -830,8 +830,8 @@ class TestWikiDocumentOrderingE2E(WikiFixtureMixin, FrappeTestCase):
 		self.assertEqual(child3.parent_wiki_document, group.name)
 
 
-class TestRebuildWikiTree(WikiFixtureMixin, FrappeTestCase):
-	"""Tests for the rebuild_wiki_tree function."""
+class TestReorderParentChange(WikiFixtureMixin, FrappeTestCase):
+	"""A parent change moves only the affected subtree in the nested set."""
 
 	def setUp(self):
 		frappe.set_user("Administrator")
@@ -840,32 +840,58 @@ class TestRebuildWikiTree(WikiFixtureMixin, FrappeTestCase):
 		frappe.set_user("Administrator")
 		frappe.db.rollback()
 
-	def test_rebuild_respects_sort_order(self):
-		"""Test that rebuild_wiki_tree respects sort_order field."""
+	def move(self, doc_name: str, new_parent: str):
+		from wiki.api.wiki_space import reorder_wiki_documents
+
+		return reorder_wiki_documents(doc_name, new_parent, 0, json.dumps([doc_name]))
+
+	def count_move_queries(self, doc_name: str, new_parent: str) -> int:
+		from unittest.mock import patch
+
+		with patch.object(frappe.db, "sql", wraps=frappe.db.sql) as sql:
+			self.move(doc_name, new_parent)
+		return sql.call_count
+
+	def test_move_keeps_nested_set_valid(self):
 		space = create_test_wiki_space(self)
+		group_a = create_wiki_document(self, space.root_group, "Group A", is_group=True)
+		group_b = create_wiki_document(self, space.root_group, "Group B", is_group=True)
+		page = create_wiki_document(self, group_a.name, "Page", is_group=True)
+		child = create_wiki_document(self, page.name, "Child")
 
-		# Create pages with explicit sort orders (reverse alphabetical)
-		page_c = create_wiki_document(self, space.root_group, "Page C")
-		page_b = create_wiki_document(self, space.root_group, "Page B")
-		page_a = create_wiki_document(self, space.root_group, "Page A")
+		self.move(page.name, group_b.name)
 
-		# Set sort orders to put them in reverse order
-		frappe.db.set_value("Wiki Document", page_c.name, "sort_order", 0)
-		frappe.db.set_value("Wiki Document", page_b.name, "sort_order", 1)
-		frappe.db.set_value("Wiki Document", page_a.name, "sort_order", 2)
+		for doc in (group_a, group_b, page, child):
+			doc.reload()
+		self.assertEqual(page.parent_wiki_document, group_b.name)
+		self.assertEqual(page.old_parent, group_b.name)
+		self.assertTrue(group_b.lft < page.lft < child.lft < child.rgt < page.rgt < group_b.rgt)
+		self.assertEqual(group_a.rgt, group_a.lft + 1)
 
-		from wiki.api.wiki_space import rebuild_wiki_tree
+	def test_move_into_own_descendant_is_rejected(self):
+		from frappe.utils.nestedset import NestedSetRecursionError
 
-		rebuild_wiki_tree()
+		space = create_test_wiki_space(self)
+		group = create_wiki_document(self, space.root_group, "Group", is_group=True)
+		child = create_wiki_document(self, group.name, "Child", is_group=True)
 
-		# Reload and check lft values
-		page_c.reload()
-		page_b.reload()
-		page_a.reload()
+		with self.assertRaises(NestedSetRecursionError):
+			self.move(group.name, child.name)
 
-		# Page C should have lowest lft (comes first)
-		self.assertLess(page_c.lft, page_b.lft)
-		self.assertLess(page_b.lft, page_a.lft)
+	def test_move_cost_does_not_grow_with_site_size(self):
+		space = create_test_wiki_space(self)
+		group_a = create_wiki_document(self, space.root_group, "Group A", is_group=True)
+		group_b = create_wiki_document(self, space.root_group, "Group B", is_group=True)
+		page = create_wiki_document(self, group_a.name, "Page")
+
+		self.move(page.name, group_b.name)
+		baseline = self.count_move_queries(page.name, group_a.name)
+
+		other_space = create_test_wiki_space(self)
+		for index in range(20):
+			create_wiki_document(self, other_space.root_group, f"Other {index}")
+
+		self.assertEqual(self.count_move_queries(page.name, group_b.name), baseline)
 
 
 class TestRestrictedSpaces(WikiFixtureMixin, FrappeTestCase):
@@ -892,6 +918,17 @@ class TestRestrictedSpaces(WikiFixtureMixin, FrappeTestCase):
 
 		space = create_test_wiki_space(self)
 		space.append("roles", {"role": "Guest", "permission_level": "Read"})
+		space.save()
+
+		self.assertEqual(get_restricted_spaces([space.name]), [])
+
+	def test_an_all_role_is_not_restricted(self):
+		"""frappe.get_roles() returns All for every logged-in user."""
+		from wiki.api.wiki_space import get_restricted_spaces
+
+		space = create_test_wiki_space(self)
+		space.append("roles", {"role": "All", "permission_level": "Read"})
+		space.append("roles", {"role": "Wiki Approver", "permission_level": "Write"})
 		space.save()
 
 		self.assertEqual(get_restricted_spaces([space.name]), [])
@@ -923,18 +960,110 @@ class TestRestrictedSpaces(WikiFixtureMixin, FrappeTestCase):
 
 		self.assertEqual(get_restricted_spaces([]), [])
 
-	def test_a_json_string_is_accepted(self):
-		"""The frontend posts the list as JSON."""
-		from wiki.api.wiki_space import get_restricted_spaces
+	def test_non_string_names_are_rejected(self):
+		"""Objects and numbers would reach the SQL `in` clause unescaped or type-coerced."""
+		from wiki.api.wiki_space import get_restricted_spaces, get_space_stats
+
+		for payload in ([{"name": "x"}], [1, 2], [["x"]], {"a": 1}, "x"):
+			for endpoint in (get_restricted_spaces, get_space_stats):
+				with self.subTest(payload=payload, endpoint=endpoint.__name__):
+					self.assertRaises(frappe.FrappeTypeError, endpoint, payload)
+
+	def test_restricted_space_is_hidden_from_outsiders(self):
+		from wiki.frappe_wiki.doctype.wiki_document.wiki_document import get_breadcrumbs
+		from wiki.wiki.doctype.wiki_settings.wiki_settings import get_all_spaces
 
 		space = create_test_wiki_space(self)
-		space.append("roles", {"role": "Wiki Approver", "permission_level": "Read"})
+		space.append("roles", {"role": "Wiki Manager", "permission_level": "Read"})
 		space.save()
+		page = create_wiki_document(self, space.root_group, "Hidden page")
 
-		self.assertEqual(get_restricted_spaces(json.dumps([space.name])), [space.name])
+		frappe.set_user(create_test_user("restricted-outsider@example.com", ["Wiki User"]).name)
+		self.assertNotIn(space.route, get_all_spaces())
+		with self.assertRaises(frappe.PermissionError):
+			get_breadcrumbs(page.name)
 
 
 # Helper functions
+
+
+class TestSpaceBootstrap(WikiFixtureMixin, FrappeTestCase):
+	def setUp(self):
+		frappe.set_user("Administrator")
+
+	def tearDown(self):
+		frappe.set_user("Administrator")
+		frappe.db.rollback()
+
+	def test_an_editor_gets_their_draft(self):
+		from wiki.api.wiki_space import get_space_bootstrap
+
+		space = self.wiki.space(pages=[{"title": "Alpha"}])
+
+		bootstrap = get_space_bootstrap(space.name)
+
+		self.assertEqual(bootstrap["doc"]["name"], space.name)
+		self.assertTrue(bootstrap["capabilities"]["can_contribute"])
+		self.assertEqual(bootstrap["change_request"]["wiki_space"], space.name)
+		self.assertEqual(bootstrap["change_request"]["owner"], "Administrator")
+
+	def test_a_reader_who_cannot_contribute_gets_no_draft(self):
+		from wiki.api.wiki_space import get_space_bootstrap
+
+		space = self.wiki.space(
+			pages=[{"title": "Alpha"}],
+			roles=[("Wiki User", "Read")],
+			allow_contributions=0,
+		)
+		reader = create_test_user("bootstrap-reader@example.com", ["Wiki User"]).name
+		frappe.set_user(reader)
+
+		bootstrap = get_space_bootstrap(space.name)
+
+		self.assertFalse(bootstrap["capabilities"]["can_contribute"])
+		self.assertIsNone(bootstrap["change_request"])
+		self.assertFalse(frappe.db.exists("Wiki Change Request", {"wiki_space": space.name, "owner": reader}))
+
+	def test_a_git_synced_space_gets_no_draft(self):
+		from wiki.api.wiki_space import get_space_bootstrap
+
+		space = self.wiki.space(git_synced=1, repo_full_name="acme/docs", branch="main")
+
+		bootstrap = get_space_bootstrap(space.name)
+
+		self.assertTrue(bootstrap["capabilities"]["can_contribute"])
+		self.assertIsNone(bootstrap["change_request"])
+
+	def test_an_outsider_is_refused(self):
+		from wiki.api.wiki_space import get_space_bootstrap
+
+		space = self.wiki.space(roles=[("Wiki Manager", "Read")])
+		frappe.set_user(create_test_user("bootstrap-outsider@example.com", ["Wiki User"]).name)
+
+		with self.assertRaises(frappe.PermissionError):
+			get_space_bootstrap(space.name)
+
+
+class TestAppBoot(FrappeTestCase):
+	def tearDown(self):
+		frappe.set_user("Administrator")
+
+	def test_the_boot_carries_the_user(self):
+		from wiki.www.wiki_app import get_boot
+
+		boot = get_boot()
+
+		self.assertEqual(boot["user_info"]["name"], "Administrator")
+		self.assertIn({"role": "System Manager"}, boot["user_info"]["roles"])
+		# wiki-app.html renders each boot key with Jinja's plain-json `tojson`.
+		json.dumps(boot)
+
+	def test_the_boot_marks_a_guest_as_logged_out(self):
+		from wiki.www.wiki_app import get_boot
+
+		frappe.set_user("Guest")
+
+		self.assertEqual(get_boot()["user_info"], {"is_logged_in": False})
 
 
 class TestSpaceStats(WikiFixtureMixin, FrappeTestCase):
@@ -1029,14 +1158,6 @@ class TestSpaceStats(WikiFixtureMixin, FrappeTestCase):
 		from wiki.api.wiki_space import get_space_stats
 
 		self.assertEqual(get_space_stats([]), {})
-
-	def test_a_json_string_is_accepted(self):
-		"""The frontend posts the list as JSON."""
-		from wiki.api.wiki_space import get_space_stats
-
-		space = create_test_wiki_space(self)
-
-		self.assertIn(space.name, get_space_stats(json.dumps([space.name])))
 
 
 def create_test_wiki_space(test_case):
@@ -1283,3 +1404,28 @@ class TestWikiWebpConversion(FrappeTestCase):
 		self.webp_paths = [get_files_path(url.split("/files/")[-1]) for url in (first_url, second_url)]
 
 		self.assertNotEqual(first_url, second_url)
+
+	def test_concurrent_same_named_uploads_do_not_overwrite(self):
+		"""Images pasted together upload in parallel. Both requests saw the same `.webp` name as free,
+		and the second write replaced the first image. Simulate the other request winning the race."""
+		from unittest.mock import patch
+
+		from frappe.utils import get_files_path
+
+		from wiki.api import convert_file_to_webp
+
+		taken_name = f"race-{frappe.generate_hash(length=8)}.webp"
+		taken_path = get_files_path(taken_name)
+		with open(taken_path, "wb") as f:
+			f.write(b"the other request's image")
+		self.webp_paths = [taken_path]
+
+		file_doc = self.upload_png((0, 255, 0))
+		with patch("frappe.core.doctype.file.utils.generate_file_name", return_value=taken_name):
+			url = convert_file_to_webp(file_doc)
+		self.webp_paths.append(get_files_path(url.split("/files/")[-1]))
+
+		self.assertNotEqual(url, f"/files/{taken_name}")
+		self.assertTrue(url.endswith(".webp"))
+		with open(taken_path, "rb") as f:
+			self.assertEqual(f.read(), b"the other request's image")

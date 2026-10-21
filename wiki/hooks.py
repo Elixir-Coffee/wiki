@@ -138,6 +138,10 @@ doc_events = {
 	},
 }
 
+# The cached sitemap also lists the site's other pages (Builder, Web Page, ...),
+# which change without touching the wiki but always clear the website cache.
+website_clear_cache = "wiki.wiki.crawler_cache.clear_crawler_cache"
+
 # Auto-prune the webhook delivery log (Frappe's daily log-clearing runs each
 # doctype's `clear_old_logs`).
 default_log_clearing_doctypes = {
@@ -147,11 +151,16 @@ default_log_clearing_doctypes = {
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
-# 	"cron": {
-# 		"*/15 * * * *": ["wiki.wiki.doctype.wiki_page.search.build_index_in_background"],
-# 	},
-# }
+scheduler_events = {
+	"cron": {
+		"*/10 * * * *": [
+			"wiki.analytics_store.ingest_recent_views",
+		],
+	},
+	"daily": [
+		"wiki.telemetry_scan.send_site_profile",
+	],
+}
 
 # scheduler_events = {
 # 	"all": [

@@ -91,6 +91,7 @@
 										/>
 									</div>
 								</div>
+								<PageMetaLine :key="wikiDoc.doc.name" :doc="wikiDoc.doc" :title="displayTitle" :content="editorContent" />
 							</div>
 						</template>
 					</WikiEditor>
@@ -113,12 +114,10 @@
 					:doc-key="wikiDoc.doc?.doc_key"
 					:readonly="readonly"
 					:title="displayTitle"
-					:slug="displaySlug"
 					:route="displayRoute"
 					:published="displayPublished"
 					:content="editorContent"
 					@close="closePageSettings"
-					@node-updated="loadCrPage"
 				/>
 			</div>
 		</div>
@@ -206,6 +205,7 @@ import { buildGithubEditUrl } from '@/lib/github';
 import { SPACE_TREE_KEY, crumbRoute, trailToNode } from '@/lib/spaceTree';
 import { useChangeRequestStore } from '@/stores/changeRequest';
 import { useDraftWorkspaceStore } from '@/stores/draftWorkspace';
+import { useSpaceStore } from '@/stores/space';
 import {
 	Badge,
 	Breadcrumbs,
@@ -223,6 +223,8 @@ import {
 } from 'frappe-ui';
 import { computed, inject, ref, shallowRef, watch } from 'vue';
 import { useRouter } from 'vue-router';
+import { useRecentPages } from '../composables/useRecentPages';
+import PageMetaLine from './PageMetaLine.vue';
 import PageSettingsPanel from './PageSettingsPanel.vue';
 import SubmitForReviewButton from './SubmitForReviewButton.vue';
 import WikiEditor from './WikiEditor.vue';
@@ -256,6 +258,8 @@ const isDeleting = ref(false);
 const router = useRouter();
 const crStore = useChangeRequestStore();
 const draftStore = useDraftWorkspaceStore();
+const spaceStore = useSpaceStore();
+const { recordVisit } = useRecentPages();
 
 // frappe-ui caches document resources by (doctype, name), so revisiting an
 // already-opened page renders instantly from the cached doc while `auto`
@@ -266,6 +270,7 @@ function makeWikiDocResource(pageId) {
 		doctype: 'Wiki Document',
 		name: pageId,
 		auto: true,
+		whitelistedMethods: { updateMeta: 'update_meta' },
 	});
 }
 
@@ -288,11 +293,16 @@ watch(
 );
 
 watch(
-	[() => crStore.currentChangeRequest?.name, () => wikiDoc.value.doc?.doc_key],
-	async ([crName, docKey], [oldCrName]) => {
-		// Read-only (git-synced) pages render straight from the published doc —
-		// no change request overlay, so skip the CR-page load entirely.
-		if (props.readonly) return;
+	[
+		() => crStore.currentChangeRequest?.name,
+		() => wikiDoc.value.doc?.doc_key,
+		() => spaceStore.canEdit,
+	],
+	async ([crName, docKey, canEdit], [oldCrName]) => {
+		// Read-only pages render straight from the published doc, with no change
+		// request overlay. Until the capabilities land we cannot tell, and asking
+		// a reader's space for a change request answers 403.
+		if (!canEdit) return;
 		if (docKey) {
 			// Navigation cancels the previous page's debounced autosave;
 			// flush its buffer now. Failures surface via the sync pill.
@@ -350,7 +360,7 @@ async function loadCrPage() {
 			draftStore.isHydrating ||
 			!crStore.currentChangeRequest)
 	) {
-		await draftStore.hydrate(props.spaceId);
+		await draftStore.hydrateForPage(props.spaceId, docKey);
 	}
 	const page = crStore.currentChangeRequest
 		? await draftStore.loadCrPage(docKey)
@@ -407,6 +417,13 @@ const displayRoute = computed(() => {
 	);
 });
 
+watch(
+	[() => props.pageId, displayTitle, displayRoute],
+	([pageId, title, route]) =>
+		recordVisit({ name: pageId, title, space: props.spaceId, route }),
+	{ immediate: true },
+);
+
 // The panel is module-scoped state: it stays open across page switches, and
 // the toggle that owns it lives in this header.
 const {
@@ -414,12 +431,6 @@ const {
 	close: closePageSettings,
 	toggle: togglePageSettings,
 } = usePageSettingsPanel();
-
-// Slug has no draft buffer — nothing but the settings panel edits it — so the
-// CR overlay is the newest copy until the request merges.
-const displaySlug = computed(
-	() => currentCrPage.value?.slug || wikiDoc.value.doc?.slug || '',
-);
 
 const spaceTree = inject(SPACE_TREE_KEY, null);
 
@@ -564,7 +575,6 @@ async function renamePage(close) {
 	isRenaming.value = true;
 	try {
 		await draftStore.updateNode(wikiDoc.value.doc.doc_key, { title: newTitle });
-		await loadCrPage();
 		close();
 	} catch (error) {
 		toast.error(error.messages?.[0] || __('Error updating title'));
@@ -607,7 +617,6 @@ async function saveTitleIfChanged() {
 	if (!wikiDoc.value.doc?.doc_key) return;
 	try {
 		await draftStore.updateNode(wikiDoc.value.doc.doc_key, { title: newTitle });
-		await loadCrPage();
 	} catch (error) {
 		toast.error(error.messages?.[0] || __('Error updating title'));
 	}
@@ -620,7 +629,6 @@ async function togglePublish() {
 		await draftStore.updateNode(wikiDoc.value.doc.doc_key, {
 			is_published: newStatus,
 		});
-		await loadCrPage();
 	} catch (error) {
 		toast.error(error.messages?.[0] || __('Error updating publish status'));
 	}
@@ -656,11 +664,9 @@ async function saveContent(content) {
 			content,
 			editableTitle.value,
 		);
-		// Refresh the CR overlay snapshot so the panel's title/route/etc.
-		// stay in sync with the change we just wrote. Inline failure UX
-		// lands in task #7.
-		await loadCrPage();
 	} catch (error) {
+		// The sync alert says so and stays up; a toast per blocked autosave would not.
+		if (error.code === 'version_conflict') return;
 		console.error('Error saving change request:', error);
 		toast.error(
 			error.messages?.[0] || error.message || __('Error saving draft'),

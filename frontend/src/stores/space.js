@@ -28,7 +28,7 @@ export const useSpaceStore = defineStore('space', () => {
 	const selectedDraftKey = computed(() => route.value.params.docKey || null);
 
 	// createDocumentResource caches by doctype+name, so re-entering a space
-	// reuses the loaded document instead of refetching it.
+	// shows the loaded document until the bootstrap below refreshes it.
 	const space = ref(null);
 	watch(
 		spaceId,
@@ -37,7 +37,7 @@ export const useSpaceStore = defineStore('space', () => {
 				? createDocumentResource({
 						doctype: 'Wiki Space',
 						name: id,
-						auto: true,
+						auto: false,
 						whitelistedMethods: {
 							updateRoutes: 'update_routes',
 							cloneWikiSpace: 'clone_wiki_space_in_background',
@@ -70,18 +70,53 @@ export const useSpaceStore = defineStore('space', () => {
 
 	// Editing a space is gated server-side; this only hides the UI.
 	const canWriteSpace = ref(false);
-	const capabilitiesResource = createResource({
-		url: 'wiki.api.get_space_capabilities',
-		onSuccess: (data) => {
-			canWriteSpace.value = Boolean(data?.can_write);
-		},
+	const canDeleteSpace = ref(false);
+	// null until the capabilities land: a space is neither drafted nor read-only
+	// until we know which, and picking either one early hydrates the wrong tree.
+	const canContribute = ref(null);
+	// A synced space is read-only for everyone, and a space this user cannot
+	// contribute to is read-only for them: neither can open a change request.
+	const isReadonly = computed(
+		() => isGitSynced.value || canContribute.value === false,
+	);
+	// Not simply !isReadonly: while the capabilities are pending a space is
+	// neither, and anything that opens a change request must wait for a yes.
+	const canEdit = computed(
+		() => !isGitSynced.value && canContribute.value === true,
+	);
+	// The space document, the capabilities and the user's draft, in one round
+	// trip instead of three in a row.
+	const bootstrapResource = createResource({
+		url: 'wiki.api.wiki_space.get_space_bootstrap',
 	});
+
+	// Held until the hydrate watcher below takes it. Taken once: a later
+	// trigger, such as a settings change, fetches fresh.
+	let bootstrapDraft = null;
+	function takeBootstrapDraft(id) {
+		const draft = bootstrapDraft?.wiki_space === id ? bootstrapDraft : null;
+		bootstrapDraft = null;
+		return draft;
+	}
 
 	watch(
 		spaceId,
-		(id) => {
+		async (id) => {
 			canWriteSpace.value = false;
-			if (id) capabilitiesResource.submit({ space: id });
+			canDeleteSpace.value = false;
+			canContribute.value = null;
+			bootstrapDraft = null;
+			if (!id) return;
+			const data = await bootstrapResource
+				.submit({ space_id: id })
+				.catch(() => null);
+			if (!data || id !== spaceId.value) return;
+			bootstrapDraft = data.change_request;
+			space.value.setDoc(data.doc);
+			space.value.originalDoc = JSON.parse(JSON.stringify(data.doc));
+			canWriteSpace.value = Boolean(data.capabilities.can_write);
+			canDeleteSpace.value = Boolean(data.capabilities.can_delete);
+			canContribute.value = Boolean(data.capabilities.can_contribute);
 		},
 		{ immediate: true },
 	);
@@ -140,14 +175,23 @@ export const useSpaceStore = defineStore('space', () => {
 		// singleton still hydrated for the previous space. Returning a stale tree
 		// here makes auto-open navigate into the wrong space's page, so gate each
 		// on belonging to the current space.
-		if (isGitSynced.value) {
+		if (isReadonly.value) {
 			return readonlyTreeSpaceId.value === spaceId.value
 				? readonlyTreeData.value
 				: null;
 		}
 		if (draftStore.spaceId !== spaceId.value) return null;
-		return draftStore.hasLoadedTree ? draftStore.treeAsLegacy : null;
+		if (draftStore.hasLoadedTree) return draftStore.treeAsLegacy;
+		return draftStore.hasStaleTree ? draftStore.staleTreeAsLegacy : null;
 	});
+
+	const isTreeStale = computed(
+		() =>
+			!isReadonly.value &&
+			draftStore.spaceId === spaceId.value &&
+			!draftStore.hasLoadedTree &&
+			draftStore.hasStaleTree,
+	);
 
 	const changeTypeMap = computed(() => {
 		const map = new Map();
@@ -237,9 +281,14 @@ export const useSpaceStore = defineStore('space', () => {
 			() => doc.value?.name,
 			() => doc.value?.git_synced,
 			() => crStore.isChangeRequestMode,
+			canContribute,
 		],
-		async ([name, gitSynced, isMode], previous) => {
+		async ([name, gitSynced, isMode, mayContribute], previous) => {
 			if (!name || !isMode) return;
+			// Contributions can be switched off for a space, or withheld from this
+			// user. Opening a change request would be refused server-side, leaving
+			// the tree stuck on its loading skeleton.
+			if (mayContribute !== true) return;
 			// Synced spaces never open a change request — they hydrate the
 			// read-only tree path below instead.
 			if (gitSynced) return;
@@ -250,22 +299,25 @@ export const useSpaceStore = defineStore('space', () => {
 				draftStore.reset();
 			}
 
-			await draftStore.hydrate(spaceId.value);
+			await draftStore.hydrate(spaceId.value, takeBootstrapDraft(name));
 		},
 		{ immediate: true },
 	);
 
-	// Read-only tree hydration for git-synced spaces. Loads the published live
-	// tree (no CR) and, for a never-synced space (e.g. just created), kicks off
-	// the first sync so its content appears without a manual click.
+	// Read-only tree hydration: git-synced spaces, and anyone who cannot open a
+	// change request here. Loads the published live tree (no CR) and, for a
+	// never-synced space (e.g. just created), kicks off the first sync so its
+	// content appears without a manual click.
 	// Same keying as above, and for the same reason: a field write on a synced
 	// space must not refetch its tree.
 	watch(
-		[() => doc.value?.name, () => doc.value?.git_synced],
-		async ([name, gitSynced]) => {
+		[() => doc.value?.name, () => doc.value?.git_synced, canContribute],
+		async ([name, gitSynced, mayContribute]) => {
 			const currentDoc = doc.value;
-			if (!name || !gitSynced || !currentDoc) return;
+			if (!name || !currentDoc) return;
+			if (!gitSynced && mayContribute !== false) return;
 			await loadReadonlyTree();
+			if (!gitSynced) return;
 			// First-ever sync of a freshly-created space: kick it once, silently —
 			// the "created successfully" toast already covers the action, and the
 			// status badge reflects progress. The guard stops a double-enqueue.
@@ -282,7 +334,7 @@ export const useSpaceStore = defineStore('space', () => {
 	);
 
 	async function refreshTree() {
-		if (isGitSynced.value) {
+		if (isReadonly.value) {
 			await loadReadonlyTree();
 			return;
 		}
@@ -301,9 +353,14 @@ export const useSpaceStore = defineStore('space', () => {
 		isGitSynced,
 		syncStatusLabel,
 		canWriteSpace,
+		canDeleteSpace,
+		canContribute,
+		isReadonly,
+		canEdit,
 		selectedPageId,
 		selectedDraftKey,
 		treeData,
+		isTreeStale,
 		changeTypeMap,
 		isTreeReordering,
 		setTreeReordering,

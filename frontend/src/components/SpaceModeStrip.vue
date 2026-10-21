@@ -49,7 +49,7 @@
 	</div>
 
 	<div
-		v-else-if="crStore.isChangeRequestMode"
+		v-else-if="crStore.isChangeRequestMode && spaceStore.canEdit"
 		class="contribution-strip shrink-0 px-2 pt-2"
 	>
 		<!-- 260px does not fit a label and two buttons on one line, so the meta
@@ -322,7 +322,7 @@ const syncedLine = computed(() => {
 // failed — submitting a stale backend CR would silently drop the user's
 // in-flight edits. Unsaved editor content (debounced autosave hasn't fired
 // yet) also counts: without this guard a user could type and submit
-// within the 10s autosave window, sending the previous content. Reorder
+// before autosave fires, sending the previous content. Reorder
 // counts as pending too via isTreeReordering.
 const hasUnsyncedWork = computed(() => Boolean(draftStore.finalizationBlocker));
 // `Reload latest` is the first-line recovery for conflicts and sync
@@ -383,6 +383,12 @@ const mergeButtonTitle = computed(() => {
 	}
 	if (draftStore.finalizationBlocker === 'failed') {
 		return __('Resolve failed changes before merging');
+	}
+	if (draftStore.finalizationBlocker === 'uploading') {
+		return __('Wait for uploads to finish before merging');
+	}
+	if (draftStore.finalizationBlocker === 'upload-failed') {
+		return __('Remove failed uploads before merging');
 	}
 	if (draftStore.finalizationBlocker === 'pending') {
 		return __('Wait for pending changes to sync before merging');
